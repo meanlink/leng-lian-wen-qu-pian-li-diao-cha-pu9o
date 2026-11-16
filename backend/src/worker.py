@@ -4,9 +4,10 @@ from sqlalchemy import select
 from redis import Redis
 from src.config.database import Session
 from src.config.settings import REDIS_URL
-from src.models import Job, Dataset, Report
+from src.models import Job, Dataset, Report, Recall
 from src.services.business import analyze
 from src.services.reports import deliver
+from src.services.recall import resume_recall
 from src.services.audit import record
 logging.basicConfig(level=logging.INFO)
 def execute(job_id):
@@ -25,11 +26,20 @@ def execute(job_id):
             j.status='failed';j.error=str(e)[:990];j.finished_at=time.time()
             record(db,'worker','job.failed',{'id':j.id,'error':j.error})
         db.commit()
+def resume_recalls(db):
+    # 召回在单事务内传播；若确认后进程中断，重启后由此处幂等恢复
+    ids=list(db.scalars(select(Recall.id).where(Recall.status=='propagating')))
+    for rid in ids:
+        try:
+            r=resume_recall(db,rid); record(db,'worker','recall.recovered',{'id':rid,'status':r.status})
+        except Exception:
+            logging.exception('Recall resume failed for %s',rid); db.rollback()
 def tick():
     with Session() as db:
         queued=list(db.scalars(select(Job.id).where(Job.status=='queued').limit(3)))
     for job_id in queued:execute(job_id)
     with Session() as db:
+        resume_recalls(db)
         for r in db.scalars(select(Report).where(Report.enabled==True,Report.next_run<=time.time())):
             d=deliver(db,r)
             if d:record(db,'worker','report.delivered',{'id':r.id,'delivery':d.id})
